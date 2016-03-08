@@ -194,12 +194,14 @@ local function main(params)
   end
 
   print(net)
+  local net_params = {}
   local grad_layers = {}
   for i,v in ipairs(net.modules) do
      if torch.type(v):find'SpatialConvolution' then
         local c, params = autograd.cudnn.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
         params = {v.weight, v.bias}
-        table.insert(grad_layers, {layer = c, params = params})
+        table.insert(grad_layers, {layer = c, params = #net_params + 1})
+        table.insert(net_params, params)
      elseif torch.type(v):find'ReLU' then
         local c = autograd.cudnn.ReLU(true)
         table.insert(grad_layers, {layer = c})
@@ -218,7 +220,7 @@ local function main(params)
      return x * torch.transpose(x,1,2)
   end
 
-  local function f(input)
+  local function f(layers, input)
      local output = input
      local style_outputs, content_outputs = {}, {}
      for i,v in ipairs(grad_layers) do
@@ -227,7 +229,7 @@ local function main(params)
         elseif v.type == 'content' then
            table.insert(content_outputs, output)
         elseif v.params then
-           output = v.layer(v.params, output)
+           output = v.layer(layers[v.params], output)
         else
            output = v.layer(output)
         end
@@ -238,7 +240,7 @@ local function main(params)
   -- compute targets
   local style_targets = {}
   for i,v in ipairs(style_images_caffe) do
-     for j,u in ipairs(f(v)[1]) do
+     for j,u in ipairs(f(net_params, v)[1]) do
         local target = style_targets[j]
         if i == 1 then
            target = gram(u):zero()
@@ -248,21 +250,21 @@ local function main(params)
      end
   end
   local content_targets = {}
-  for j,u in ipairs(f(content_image_caffe)[2]) do
+  for j,u in ipairs(f(net_params, content_image_caffe)[2]) do
      content_targets[j] = u:clone()
   end
   local targets = {style_targets, content_targets}
 
-  local function predict(param, input, target)
-     local outputs = f(param)
+  local function predict(param, layers, target)
+     local outputs = f(layers, param)
      local loss = 0
      for i,v in ipairs(outputs[1]) do
         local n = torch.nElement(v)
-        local gram_n = torch.nElement(targets[1][i])
-        loss = loss + params.style_weight * autograd.loss.leastSquares(gram(v) / n, targets[1][i]) / gram_n
+        local gram_n = torch.nElement(target[1][i])
+        loss = loss + params.style_weight * autograd.loss.leastSquares(gram(v) / n, target[1][i]) / gram_n
      end
      for i,v in ipairs(outputs[2]) do
-        loss = loss + params.content_weight * autograd.loss.leastSquares(v, targets[2][i]) / torch.nElement(v)
+        loss = loss + params.content_weight * autograd.loss.leastSquares(v, target[2][i]) / torch.nElement(v)
      end
      return loss
   end
@@ -294,10 +296,10 @@ local function main(params)
   end
   img = cast(img)
 
-  print{predict(img)}
+  -- print{predict({img}, grad_layers, targets)}
 
   print'autograd output'
-  print{g(img)}
+  print{g(img, net_params, targets)}
 
   -- net:remove(1)
   
@@ -305,14 +307,14 @@ local function main(params)
   -- All the gradients will come from the extra loss modules, so we just pass
   -- zeros into the top of the net on the backward pass.
   local y = net:forward(img)
-  local y_ = f(img)
+  local y_ = f(net_params, img)
   local dy = img.new(#y):zero()
 
   -- require'fb.debugger'.enter() 
 
   print{(y - y_[3]):abs():max()}
   local df = net:updateGradInput(img, dy)
-  print{(df - g(img)):abs():max()}
+  print{(df - g(img, net_params, targets)):abs():max()}
 
   -- os.exit()
 
@@ -366,9 +368,12 @@ local function main(params)
   -- and saving intermediate results.
   local num_calls = 0
   local function feval(x)
-    -- num_calls = num_calls + 1
+    num_calls = num_calls + 1
+
+    -- local t = torch.tic()
     -- net:forward(x)
     -- local grad = net:updateGradInput(x, dy)
+    -- print('nn',torch.toc(t))
     -- local loss = 0
     -- for _, mod in ipairs(content_losses) do
     --   loss = loss + mod.loss
@@ -376,12 +381,16 @@ local function main(params)
     -- for _, mod in ipairs(style_losses) do
     --   loss = loss + mod.loss
     -- end
-    -- maybe_print(num_calls, loss)
-    -- maybe_save(num_calls)
+
+    -- local s = torch.tic()
+    local grad, loss = g(x, net_params, targets)
+    -- print('autograd',torch.toc(s))
+    
+    maybe_print(num_calls, loss)
+    maybe_save(num_calls)
 
     -- collectgarbage()
     -- optim.lbfgs expects a vector for gradients
-    local grad, loss = g(x)
     return loss, grad:view(grad:nElement())
   end
 
