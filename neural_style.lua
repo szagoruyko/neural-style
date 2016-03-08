@@ -65,19 +65,24 @@ local function main(params)
     if params.cudnn_autotune then
       cudnn.benchmark = true
     end
-    cudnn.SpatialConvolution.accGradParameters = nn.SpatialConvolutionMM.accGradParameters -- ie: nop
+  end
+
+  local function cast(m)
+     m = m:float()
+     if params.gpu >= 0 then
+        if params.backend ~= 'clnn' then
+           m = m:cuda()
+        else
+           m = m:cl()
+        end
+     end
+     return m
   end
   
   local loadcaffe_backend = params.backend
   if params.backend == 'clnn' then loadcaffe_backend = 'nn' end
   local cnn = loadcaffe.load(params.proto_file, params.model_file, loadcaffe_backend):float()
-  if params.gpu >= 0 then
-    if params.backend ~= 'clnn' then
-      cnn:cuda()
-    else
-      cnn:cl()
-    end
-  end
+  cast(cnn)
   
   local content_image = image.load(params.content_image, 3)
   content_image = image.scale(content_image, params.image_size, 'bilinear')
@@ -117,18 +122,9 @@ local function main(params)
   end
   
 
-  if params.gpu >= 0 then
-    if params.backend ~= 'clnn' then
-      content_image_caffe = content_image_caffe:cuda()
-      for i = 1, #style_images_caffe do
-        style_images_caffe[i] = style_images_caffe[i]:cuda()
-      end
-    else
-      content_image_caffe = content_image_caffe:cl()
-      for i = 1, #style_images_caffe do
-        style_images_caffe[i] = style_images_caffe[i]:cl()
-      end
-    end
+  content_image_caffe = cast(content_image_caffe)
+  for i = 1, #style_images_caffe do
+     style_images_caffe[i] = cast(style_images_caffe[i])
   end
   
   local content_layers = params.content_layers:split(",")
@@ -139,37 +135,23 @@ local function main(params)
   local next_content_idx, next_style_idx = 1, 1
   local net = nn.Sequential()
   if params.tv_weight > 0 then
-    local tv_mod = nn.TVLoss(params.tv_weight):float()
-    if params.gpu >= 0 then
-      if params.backend ~= 'clnn' then
-        tv_mod:cuda()
-      else
-        tv_mod:cl()
-      end
-    end
+    local tv_mod = nn.TVLoss(params.tv_weight)
+    cast(tv_mod)
     net:add(tv_mod)
   end
   for i = 1, #cnn do
     if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
       local layer = cnn:get(i)
       local name = layer.name
-      local layer_type = torch.type(layer)
-      local is_pooling = (layer_type == 'cudnn.SpatialMaxPooling' or layer_type == 'nn.SpatialMaxPooling')
+      local is_pooling = torch.type(layer):find'SpatialMaxPooling'
       if is_pooling and params.pooling == 'avg' then
         assert(layer.padW == 0 and layer.padH == 0)
         local kW, kH = layer.kW, layer.kH
         local dW, dH = layer.dW, layer.dH
-        local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH):float()
-        if params.gpu >= 0 then
-          if params.backend ~= 'clnn' then
-            avg_pool_layer:cuda()
-          else
-            avg_pool_layer:cl()
-          end
-        end
+        local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH)
         local msg = 'Replacing max pooling at layer %d with average pooling'
         print(string.format(msg, i))
-        net:add(avg_pool_layer)
+        net:add(cast(avg_pool_layer))
       else
         net:add(layer)
       end
@@ -177,28 +159,15 @@ local function main(params)
         print("Setting up content layer", i, ":", layer.name)
         local target = net:forward(content_image_caffe):clone()
         local norm = params.normalize_gradients
-        local loss_module = nn.ContentLoss(params.content_weight, target, norm):float()
-        if params.gpu >= 0 then
-          if params.backend ~= 'clnn' then
-            loss_module:cuda()
-          else
-            loss_module:cl()
-          end
-        end
-        net:add(loss_module)
+        local loss_module = nn.ContentLoss(params.content_weight, target, norm)
+        net:add(cast(loss_module))
         table.insert(content_losses, loss_module)
         next_content_idx = next_content_idx + 1
       end
       if name == style_layers[next_style_idx] then
         print("Setting up style layer  ", i, ":", layer.name)
-        local gram = GramMatrix():float()
-        if params.gpu >= 0 then
-          if params.backend ~= 'clnn' then
-            gram = gram:cuda()
-          else
-            gram = gram:cl()
-          end
-        end
+        local gram = GramMatrix()
+        cast(gram)
         local target = nil
         for i = 1, #style_images_caffe do
           local target_features = net:forward(style_images_caffe[i]):clone()
@@ -212,14 +181,8 @@ local function main(params)
           end
         end
         local norm = params.normalize_gradients
-        local loss_module = nn.StyleLoss(params.style_weight, target, norm):float()
-        if params.gpu >= 0 then
-          if params.backend ~= 'clnn' then
-            loss_module:cuda()
-          else
-            loss_module:cl()
-          end
-        end
+        local loss_module = nn.StyleLoss(params.style_weight, target, norm)
+        cast(loss_module)
         net:add(loss_module)
         table.insert(style_losses, loss_module)
         next_style_idx = next_style_idx + 1
@@ -229,14 +192,13 @@ local function main(params)
 
   -- We don't need the base CNN anymore, so clean it up to save memory.
   cnn = nil
-  for i=1,#net.modules do
-    local module = net.modules[i]
-    if torch.type(module) == 'nn.SpatialConvolutionMM' then
+  net:apply(function(module)
+    if torch.type(module):find'SpatialConvolution' then
         -- remove these, not used, but uses gpu memory
         module.gradWeight = nil
         module.gradBias = nil
     end
-  end
+  end)
   collectgarbage()
   
   -- Initialize the image
@@ -251,13 +213,7 @@ local function main(params)
   else
     error('Invalid init type')
   end
-  if params.gpu >= 0 then
-    if params.backend ~= 'clnn' then
-      img = img:cuda()
-    else
-      img = img:cl()
-    end
-  end
+  img = cast(img)
   
   -- Run it through the network once to get the proper size for the gradient
   -- All the gradients will come from the extra loss modules, so we just pass
