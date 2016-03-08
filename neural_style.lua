@@ -5,6 +5,8 @@ require 'optim'
 
 require 'loadcaffe'
 
+local autograd = require 'autograd'
+
 --------------------------------------------------------------------------------
 
 local cmd = torch.CmdLine()
@@ -62,6 +64,7 @@ local function main(params)
 
   if params.backend == 'cudnn' then
     require 'cudnn'
+    autograd.cudnn = autograd.functionalize('cudnn')
     if params.cudnn_autotune then
       cudnn.benchmark = true
     end
@@ -190,6 +193,82 @@ local function main(params)
     end
   end
 
+  print(net)
+  local grad_layers = {}
+  for i,v in ipairs(net.modules) do
+     if torch.type(v):find'SpatialConvolution' then
+        local c, params = autograd.cudnn.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+        params = {v.weight, v.bias}
+        table.insert(grad_layers, {layer = c, params = params})
+     elseif torch.type(v):find'ReLU' then
+        local c = autograd.cudnn.ReLU(true)
+        table.insert(grad_layers, {layer = c})
+     elseif torch.type(v):find'MaxPooling' then
+        local c = autograd.cudnn.SpatialMaxPooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+        table.insert(grad_layers, {layer = c})
+     elseif torch.type(v):find'StyleLoss' then
+        table.insert(grad_layers, {type = 'style'})
+     elseif torch.type(v):find'ContentLoss' then
+        table.insert(grad_layers, {type = 'content'})
+     end
+  end
+
+  local function gram(x)
+     x = x:view(x:size(1),-1)
+     return x * torch.transpose(x,1,2)
+  end
+
+  local function f(input)
+     local output = input
+     local style_outputs, content_outputs = {}, {}
+     for i,v in ipairs(grad_layers) do
+        if v.type == 'style' then
+           table.insert(style_outputs, output)
+        elseif v.type == 'content' then
+           table.insert(content_outputs, output)
+        elseif v.params then
+           output = v.layer(v.params, output)
+        else
+           output = v.layer(output)
+        end
+     end
+     return {style_outputs, content_outputs, output}
+  end
+
+  -- compute targets
+  local style_targets = {}
+  for i,v in ipairs(style_images_caffe) do
+     for j,u in ipairs(f(v)[1]) do
+        local target = style_targets[j]
+        if i == 1 then
+           target = gram(u):zero()
+        end
+        target = target + gram(u) * style_blend_weights[i] / u:numel() 
+        style_targets[j] = target
+     end
+  end
+  local content_targets = {}
+  for j,u in ipairs(f(content_image_caffe)[2]) do
+     content_targets[j] = u:clone()
+  end
+  local targets = {style_targets, content_targets}
+
+  local function predict(param, input, target)
+     local outputs = f(param)
+     local loss = 0
+     for i,v in ipairs(outputs[1]) do
+        local n = torch.nElement(v)
+        local gram_n = torch.nElement(targets[1][i])
+        loss = loss + params.style_weight * autograd.loss.leastSquares(gram(v) / n, targets[1][i]) / gram_n
+     end
+     for i,v in ipairs(outputs[2]) do
+        loss = loss + params.content_weight * autograd.loss.leastSquares(v, targets[2][i]) / torch.nElement(v)
+     end
+     return loss
+  end
+
+  local g = autograd(predict, {optimize = true})
+
   -- We don't need the base CNN anymore, so clean it up to save memory.
   cnn = nil
   net:apply(function(module)
@@ -214,12 +293,28 @@ local function main(params)
     error('Invalid init type')
   end
   img = cast(img)
+
+  print{predict(img)}
+
+  print'autograd output'
+  print{g(img)}
+
+  -- net:remove(1)
   
   -- Run it through the network once to get the proper size for the gradient
   -- All the gradients will come from the extra loss modules, so we just pass
   -- zeros into the top of the net on the backward pass.
   local y = net:forward(img)
+  local y_ = f(img)
   local dy = img.new(#y):zero()
+
+  -- require'fb.debugger'.enter() 
+
+  print{(y - y_[3]):abs():max()}
+  local df = net:updateGradInput(img, dy)
+  print{(df - g(img)):abs():max()}
+
+  -- os.exit()
 
   -- Declaring this here lets us access it in maybe_print
   local optim_state = nil
@@ -271,21 +366,22 @@ local function main(params)
   -- and saving intermediate results.
   local num_calls = 0
   local function feval(x)
-    num_calls = num_calls + 1
-    net:forward(x)
-    local grad = net:updateGradInput(x, dy)
-    local loss = 0
-    for _, mod in ipairs(content_losses) do
-      loss = loss + mod.loss
-    end
-    for _, mod in ipairs(style_losses) do
-      loss = loss + mod.loss
-    end
-    maybe_print(num_calls, loss)
-    maybe_save(num_calls)
+    -- num_calls = num_calls + 1
+    -- net:forward(x)
+    -- local grad = net:updateGradInput(x, dy)
+    -- local loss = 0
+    -- for _, mod in ipairs(content_losses) do
+    --   loss = loss + mod.loss
+    -- end
+    -- for _, mod in ipairs(style_losses) do
+    --   loss = loss + mod.loss
+    -- end
+    -- maybe_print(num_calls, loss)
+    -- maybe_save(num_calls)
 
-    collectgarbage()
+    -- collectgarbage()
     -- optim.lbfgs expects a vector for gradients
+    local grad, loss = g(x)
     return loss, grad:view(grad:nElement())
   end
 
@@ -370,17 +466,26 @@ end
 
 -- Returns a network that computes the CxC Gram matrix from inputs
 -- of size C x H x W
+-- function GramMatrix(x)
+--    x = x:view(x:size(1),-1)
+--    return x * torch.transpose(x)
+-- end
+
 function GramMatrix()
-  local net = nn.Sequential()
-  net:add(nn.View(-1):setNumInputDims(2))
-  local concat = nn.ConcatTable()
-  concat:add(nn.Identity())
-  concat:add(nn.Identity())
-  net:add(concat)
-  net:add(nn.MM(false, true))
-  return net
+   local net = nn.Sequential()
+   net:add(nn.View(-1):setNumInputDims(2))
+   local concat = nn.ConcatTable()
+   concat:add(nn.Identity())
+   concat:add(nn.Identity())
+   net:add(concat)
+   net:add(nn.MM(false, true))
+   return net
 end
 
+function styleLoss(x, target)
+   local G = GramMatrix(x) / x:numel()
+   --return autograd.loss.leastSquares(x, target) * 
+end
 
 -- Define an nn Module to compute style loss in-place
 local StyleLoss, parent = torch.class('nn.StyleLoss', 'nn.Module')
