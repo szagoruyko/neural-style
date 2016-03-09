@@ -193,6 +193,8 @@ local function main(params)
     end
   end
 
+  cudnn.SpatialConvolution.accGradParameters = function() end
+
   print(net)
   local net_params = {}
   local grad_layers = {}
@@ -370,21 +372,23 @@ local function main(params)
   local function feval(x)
     num_calls = num_calls + 1
 
-    -- local t = torch.tic()
-    -- net:forward(x)
-    -- local grad = net:updateGradInput(x, dy)
-    -- print('nn',torch.toc(t))
-    -- local loss = 0
-    -- for _, mod in ipairs(content_losses) do
-    --   loss = loss + mod.loss
-    -- end
-    -- for _, mod in ipairs(style_losses) do
-    --   loss = loss + mod.loss
-    -- end
+    local t = torch.tic()
+    net:forward(x)
+    local grad = net:updateGradInput(x, dy)
+    cutorch.synchronize()
+    print('nn',torch.toc(t))
+    local loss = 0
+    for _, mod in ipairs(content_losses) do
+      loss = loss + mod.loss
+    end
+    for _, mod in ipairs(style_losses) do
+      loss = loss + mod.loss
+    end
 
-    -- local s = torch.tic()
+    local s = torch.tic()
     local grad, loss = g(x, net_params, targets)
-    -- print('autograd',torch.toc(s))
+    cutorch.synchronize()
+    print('autograd',torch.toc(s))
     
     maybe_print(num_calls, loss)
     maybe_save(num_calls)
