@@ -62,6 +62,7 @@ local function main(params)
     params.backend = 'nn'
   end
 
+  local backend = params.backend == 'cudnn' and 'cudnn' or 'nn'
   if params.backend == 'cudnn' then
     require 'cudnn'
     autograd.cudnn = autograd.functionalize('cudnn')
@@ -133,85 +134,34 @@ local function main(params)
   local content_layers = params.content_layers:split(",")
   local style_layers = params.style_layers:split(",")
 
+  -- have to disable accGradParameters manually, autograd calls backward which calls both
+  -- updateGradInput and accGradParameters
+  cast(cnn)
+  do
+     local b = backend == 'cudnn' and cudnn or nn
+     b.SpatialConvolution.accGradParameters = function() end
+  end
+
   -- Set up the network, inserting style and content loss modules
-  local content_losses, style_losses = {}, {}
-  local next_content_idx, next_style_idx = 1, 1
-  local net = nn.Sequential()
-  if params.tv_weight > 0 then
-    local tv_mod = nn.TVLoss(params.tv_weight)
-    cast(tv_mod)
-    net:add(tv_mod)
-  end
-  for i = 1, #cnn do
-    if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
-      local layer = cnn:get(i)
-      local name = layer.name
-      local is_pooling = torch.type(layer):find'SpatialMaxPooling'
-      if is_pooling and params.pooling == 'avg' then
-        assert(layer.padW == 0 and layer.padH == 0)
-        local kW, kH = layer.kW, layer.kH
-        local dW, dH = layer.dW, layer.dH
-        local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH)
-        local msg = 'Replacing max pooling at layer %d with average pooling'
-        print(string.format(msg, i))
-        net:add(cast(avg_pool_layer))
-      else
-        net:add(layer)
-      end
-      if name == content_layers[next_content_idx] then
-        print("Setting up content layer", i, ":", layer.name)
-        local target = net:forward(content_image_caffe):clone()
-        local norm = params.normalize_gradients
-        local loss_module = nn.ContentLoss(params.content_weight, target, norm)
-        net:add(cast(loss_module))
-        table.insert(content_losses, loss_module)
-        next_content_idx = next_content_idx + 1
-      end
-      if name == style_layers[next_style_idx] then
-        print("Setting up style layer  ", i, ":", layer.name)
-        local gram = GramMatrix()
-        cast(gram)
-        local target = nil
-        for i = 1, #style_images_caffe do
-          local target_features = net:forward(style_images_caffe[i]):clone()
-          local target_i = gram:forward(target_features):clone()
-          target_i:div(target_features:nElement())
-          target_i:mul(style_blend_weights[i])
-          if i == 1 then
-            target = target_i
-          else
-            target:add(target_i)
-          end
-        end
-        local norm = params.normalize_gradients
-        local loss_module = nn.StyleLoss(params.style_weight, target, norm)
-        cast(loss_module)
-        net:add(loss_module)
-        table.insert(style_losses, loss_module)
-        next_style_idx = next_style_idx + 1
-      end
-    end
-  end
-
-  cudnn.SpatialConvolution.accGradParameters = function() end
-
   local net_params,grad_layers = {}, {}
   local next_content_idx, next_style_idx = 1, 1
+  local tvloss = params.tv_weight > 0 and cast(nn.TVLoss(params.tv_weight))
+  local autograd_backend = autograd[backend]
   for i,v in ipairs(cnn.modules) do
      if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
         if torch.type(v):find'SpatialConvolution' then
-           local c, params = autograd.cudnn.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           local c, params = autograd_backend.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
            table.insert(grad_layers, {layer = c, params = #net_params + 1})
            table.insert(net_params, {v.weight, v.bias})
         elseif torch.type(v):find'ReLU' then
-           local c = autograd.cudnn.ReLU(true)
+           local c = autograd_backend.ReLU(true)
            table.insert(grad_layers, {layer = c})
         elseif torch.type(v):find'MaxPooling' then
            local pooling = params.pooling == 'avg' and 'SpatialAveragePooling' or 'SpatialMaxPooling'
-           local c = autograd.cudnn[pooling](v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           local c = autograd_backend[pooling](v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
            table.insert(grad_layers, {layer = c})
         elseif torch.type(v):find'AveragePooling' then
-           local c = autograd.cudnn.SpatialAveragePooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           local c = autograd_backend.SpatialAveragePooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
            table.insert(grad_layers, {layer = c})
         end
 
@@ -231,6 +181,7 @@ local function main(params)
      return x * torch.transpose(x,1,2)
   end
 
+  -- this is our main forward function
   local function f(layers, input)
      local output = input
      local style_outputs, content_outputs = {}, {}
@@ -247,6 +198,28 @@ local function main(params)
      end
      return {style_outputs, content_outputs, output}
   end
+  
+  -- this is our main function that computes the loss
+  -- here param is input image, layers are weights table
+  local function predict(param, layers, target)
+     local outputs = f(layers, param)
+     local loss = 0
+     local style_outputs, content_outputs = outputs[1], outputs[2]
+     local style_targets, content_targets = target[1], target[2]
+     for i,v in ipairs(style_outputs) do
+        local n = torch.nElement(v)
+        local gram_n = torch.nElement(style_targets[i])
+        loss = loss + params.style_weight * autograd.loss.leastSquares(gram(v) / n, style_targets[i]) / gram_n
+     end
+     for i,v in ipairs(content_outputs) do
+        loss = loss + params.content_weight * autograd.loss.leastSquares(v, content_targets[i]) / torch.nElement(v)
+     end
+     return loss
+  end
+
+
+  local g = autograd(predict, {optimize = true})
+
 
   -- compute targets
   local style_targets = {}
@@ -266,33 +239,6 @@ local function main(params)
   end
   local targets = {style_targets, content_targets}
 
-  local function predict(param, layers, target)
-     local outputs = f(layers, param)
-     local loss = 0
-     for i,v in ipairs(outputs[1]) do
-        local n = torch.nElement(v)
-        local gram_n = torch.nElement(target[1][i])
-        loss = loss + params.style_weight * autograd.loss.leastSquares(gram(v) / n, target[1][i]) / gram_n
-     end
-     for i,v in ipairs(outputs[2]) do
-        loss = loss + params.content_weight * autograd.loss.leastSquares(v, target[2][i]) / torch.nElement(v)
-     end
-     return loss
-  end
-
-  local g = autograd(predict, {optimize = true})
-
-  -- We don't need the base CNN anymore, so clean it up to save memory.
-  cnn = nil
-  net:apply(function(module)
-    if torch.type(module):find'SpatialConvolution' then
-        -- remove these, not used, but uses gpu memory
-        module.gradWeight = nil
-        module.gradBias = nil
-    end
-  end)
-  collectgarbage()
-  
   -- Initialize the image
   if params.seed >= 0 then
     torch.manualSeed(params.seed)
@@ -306,23 +252,6 @@ local function main(params)
     error('Invalid init type')
   end
   img = cast(img)
-
-  print'autograd output'
-  print{g(img, net_params, targets)}
-
-  net:remove(1)
-  
-  -- Run it through the network once to get the proper size for the gradient
-  -- All the gradients will come from the extra loss modules, so we just pass
-  -- zeros into the top of the net on the backward pass.
-  local y = net:forward(img)
-  local y_ = f(net_params, img)
-  local dy = img.new(#y):zero()
-
-  print{y, y_}
-  print{(y - y_[3]):abs():max()}
-  local df = net:updateGradInput(img, dy)
-  print{(df - g(img, net_params, targets)):abs():max()}
 
   -- Declaring this here lets us access it in maybe_print
   local optim_state = nil
@@ -343,12 +272,6 @@ local function main(params)
     local verbose = (params.print_iter > 0 and t % params.print_iter == 0)
     if verbose then
       print(string.format('Iteration %d / %d', t, params.num_iterations))
-      for i, loss_module in ipairs(content_losses) do
-        print(string.format('  Content %d loss: %f', i, loss_module.loss))
-      end
-      for i, loss_module in ipairs(style_losses) do
-        print(string.format('  Style %d loss: %f', i, loss_module.loss))
-      end
       print(string.format('  Total loss: %f', loss))
     end
   end
@@ -376,29 +299,12 @@ local function main(params)
   local function feval(x)
     num_calls = num_calls + 1
 
-    local t = torch.tic()
-    net:forward(x)
-    local grad = net:updateGradInput(x, dy)
-    cutorch.synchronize()
-    print('nn',torch.toc(t))
-    local loss = 0
-    for _, mod in ipairs(content_losses) do
-      loss = loss + mod.loss
-    end
-    for _, mod in ipairs(style_losses) do
-      loss = loss + mod.loss
-    end
-
-    local s = torch.tic()
     local grad, loss = g(x, net_params, targets)
-    cutorch.synchronize()
-    print('autograd',torch.toc(s))
+    if tvloss then grad = tvloss:updateGradInput(x,grad) end
     
     maybe_print(num_calls, loss)
     maybe_save(num_calls)
 
-    -- collectgarbage()
-    -- optim.lbfgs expects a vector for gradients
     return loss, grad:view(grad:nElement())
   end
 
@@ -447,132 +353,37 @@ function deprocess(img)
 end
 
 
--- Define an nn Module to compute content loss in-place
-local ContentLoss, parent = torch.class('nn.ContentLoss', 'nn.Module')
-
-function ContentLoss:__init(strength, target, normalize)
-  parent.__init(self)
-  self.strength = strength
-  self.target = target
-  self.normalize = normalize or false
-  self.loss = 0
-  self.crit = nn.MSECriterion()
-end
-
-function ContentLoss:updateOutput(input)
-  if input:nElement() == self.target:nElement() then
-    self.loss = self.crit:forward(input, self.target) * self.strength
-  else
-    print('WARNING: Skipping content loss')
-  end
-  self.output = input
-  return self.output
-end
-
-function ContentLoss:updateGradInput(input, gradOutput)
-  if input:nElement() == self.target:nElement() then
-    self.gradInput = self.crit:backward(input, self.target)
-  end
-  if self.normalize then
-    self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
-  end
-  self.gradInput:mul(self.strength)
-  self.gradInput:add(gradOutput)
-  return self.gradInput
-end
-
--- Returns a network that computes the CxC Gram matrix from inputs
--- of size C x H x W
--- function GramMatrix(x)
---    x = x:view(x:size(1),-1)
---    return x * torch.transpose(x)
--- end
-
-function GramMatrix()
-   local net = nn.Sequential()
-   net:add(nn.View(-1):setNumInputDims(2))
-   local concat = nn.ConcatTable()
-   concat:add(nn.Identity())
-   concat:add(nn.Identity())
-   net:add(concat)
-   net:add(nn.MM(false, true))
-   return net
-end
-
-function styleLoss(x, target)
-   local G = GramMatrix(x) / x:numel()
-   --return autograd.loss.leastSquares(x, target) * 
-end
-
--- Define an nn Module to compute style loss in-place
-local StyleLoss, parent = torch.class('nn.StyleLoss', 'nn.Module')
-
-function StyleLoss:__init(strength, target, normalize)
-  parent.__init(self)
-  self.normalize = normalize or false
-  self.strength = strength
-  self.target = target
-  self.loss = 0
-  
-  self.gram = GramMatrix()
-  self.G = nil
-  self.crit = nn.MSECriterion()
-end
-
-function StyleLoss:updateOutput(input)
-  self.G = self.gram:forward(input)
-  self.G:div(input:nElement())
-  self.loss = self.crit:forward(self.G, self.target)
-  self.loss = self.loss * self.strength
-  self.output = input
-  return self.output
-end
-
-function StyleLoss:updateGradInput(input, gradOutput)
-  local dG = self.crit:backward(self.G, self.target)
-  dG:div(input:nElement())
-  self.gradInput = self.gram:backward(input, dG)
-  if self.normalize then
-    self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
-  end
-  self.gradInput:mul(self.strength)
-  self.gradInput:add(gradOutput)
-  return self.gradInput
-end
-
-
 local TVLoss, parent = torch.class('nn.TVLoss', 'nn.Module')
 
 function TVLoss:__init(strength)
-  parent.__init(self)
-  self.strength = strength
-  self.x_diff = torch.Tensor()
-  self.y_diff = torch.Tensor()
+   parent.__init(self)
+   self.strength = strength
+   self.x_diff = torch.Tensor()
+   self.y_diff = torch.Tensor()
 end
 
 function TVLoss:updateOutput(input)
-  self.output = input
-  return self.output
+   self.output:set(input)
+   return self.output
 end
 
 -- TV loss backward pass inspired by kaishengtai/neuralart
 function TVLoss:updateGradInput(input, gradOutput)
-  self.gradInput:resizeAs(input):zero()
-  local C, H, W = input:size(1), input:size(2), input:size(3)
-  self.x_diff:resize(3, H - 1, W - 1)
-  self.y_diff:resize(3, H - 1, W - 1)
-  self.x_diff:copy(input[{{}, {1, -2}, {1, -2}}])
-  self.x_diff:add(-1, input[{{}, {1, -2}, {2, -1}}])
-  self.y_diff:copy(input[{{}, {1, -2}, {1, -2}}])
-  self.y_diff:add(-1, input[{{}, {2, -1}, {1, -2}}])
-  self.gradInput[{{}, {1, -2}, {1, -2}}]:add(self.x_diff):add(self.y_diff)
-  self.gradInput[{{}, {1, -2}, {2, -1}}]:add(-1, self.x_diff)
-  self.gradInput[{{}, {2, -1}, {1, -2}}]:add(-1, self.y_diff)
-  self.gradInput:mul(self.strength)
-  self.gradInput:add(gradOutput)
-  return self.gradInput
+   self.gradInput:resizeAs(input):zero()
+   local C, H, W = input:size(1), input:size(2), input:size(3)
+   self.x_diff:resize(3, H - 1, W - 1)
+   self.y_diff:resize(3, H - 1, W - 1)
+   self.x_diff:copy(input[{{}, {1, -2}, {1, -2}}])
+   self.x_diff:add(-1, input[{{}, {1, -2}, {2, -1}}])
+   self.y_diff:copy(input[{{}, {1, -2}, {1, -2}}])
+   self.y_diff:add(-1, input[{{}, {2, -1}, {1, -2}}])
+   self.gradInput[{{}, {1, -2}, {1, -2}}]:add(self.x_diff):add(self.y_diff)
+   self.gradInput[{{}, {1, -2}, {2, -1}}]:add(-1, self.x_diff)
+   self.gradInput[{{}, {2, -1}, {1, -2}}]:add(-1, self.y_diff)
+   self.gradInput:mul(self.strength)
+   self.gradInput:add(gradOutput)
+   return self.gradInput
 end
-
 
 local params = cmd:parse(arg)
 main(params)
