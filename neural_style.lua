@@ -195,25 +195,34 @@ local function main(params)
 
   cudnn.SpatialConvolution.accGradParameters = function() end
 
-  print(net)
-  local net_params = {}
-  local grad_layers = {}
-  for i,v in ipairs(net.modules) do
-     if torch.type(v):find'SpatialConvolution' then
-        local c, params = autograd.cudnn.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
-        params = {v.weight, v.bias}
-        table.insert(grad_layers, {layer = c, params = #net_params + 1})
-        table.insert(net_params, params)
-     elseif torch.type(v):find'ReLU' then
-        local c = autograd.cudnn.ReLU(true)
-        table.insert(grad_layers, {layer = c})
-     elseif torch.type(v):find'MaxPooling' then
-        local c = autograd.cudnn.SpatialMaxPooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
-        table.insert(grad_layers, {layer = c})
-     elseif torch.type(v):find'StyleLoss' then
-        table.insert(grad_layers, {type = 'style'})
-     elseif torch.type(v):find'ContentLoss' then
-        table.insert(grad_layers, {type = 'content'})
+  local net_params,grad_layers = {}, {}
+  local next_content_idx, next_style_idx = 1, 1
+  for i,v in ipairs(cnn.modules) do
+     if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
+        if torch.type(v):find'SpatialConvolution' then
+           local c, params = autograd.cudnn.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           table.insert(grad_layers, {layer = c, params = #net_params + 1})
+           table.insert(net_params, {v.weight, v.bias})
+        elseif torch.type(v):find'ReLU' then
+           local c = autograd.cudnn.ReLU(true)
+           table.insert(grad_layers, {layer = c})
+        elseif torch.type(v):find'MaxPooling' then
+           local pooling = params.pooling == 'avg' and 'SpatialAveragePooling' or 'SpatialMaxPooling'
+           local c = autograd.cudnn[pooling](v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           table.insert(grad_layers, {layer = c})
+        elseif torch.type(v):find'AveragePooling' then
+           local c = autograd.cudnn.SpatialAveragePooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
+           table.insert(grad_layers, {layer = c})
+        end
+
+        if v.name == content_layers[next_content_idx] then
+           table.insert(grad_layers, {type = 'content'})
+           next_content_idx = next_content_idx + 1
+        end
+        if v.name == style_layers[next_style_idx] then
+           table.insert(grad_layers, {type = 'style'})
+           next_style_idx = next_style_idx + 1
+        end
      end
   end
 
@@ -298,12 +307,10 @@ local function main(params)
   end
   img = cast(img)
 
-  -- print{predict({img}, grad_layers, targets)}
-
   print'autograd output'
   print{g(img, net_params, targets)}
 
-  -- net:remove(1)
+  net:remove(1)
   
   -- Run it through the network once to get the proper size for the gradient
   -- All the gradients will come from the extra loss modules, so we just pass
@@ -312,13 +319,10 @@ local function main(params)
   local y_ = f(net_params, img)
   local dy = img.new(#y):zero()
 
-  -- require'fb.debugger'.enter() 
-
+  print{y, y_}
   print{(y - y_[3]):abs():max()}
   local df = net:updateGradInput(img, dy)
   print{(df - g(img, net_params, targets)):abs():max()}
-
-  -- os.exit()
 
   -- Declaring this here lets us access it in maybe_print
   local optim_state = nil
