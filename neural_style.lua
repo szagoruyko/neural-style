@@ -149,20 +149,17 @@ local function main(params)
   local autograd_backend = autograd[backend]
   for i,v in ipairs(cnn.modules) do
      if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
-        if torch.type(v):find'SpatialConvolution' then
-           local c, params = autograd_backend.SpatialConvolution(v.nInputPlane, v.nOutputPlane, v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
-           table.insert(grad_layers, {layer = c, params = #net_params + 1})
-           table.insert(net_params, {v.weight, v.bias})
-        elseif torch.type(v):find'ReLU' then
-           local c = autograd_backend.ReLU(true)
-           table.insert(grad_layers, {layer = c})
-        elseif torch.type(v):find'MaxPooling' then
-           local pooling = params.pooling == 'avg' and 'SpatialAveragePooling' or 'SpatialMaxPooling'
-           local c = autograd_backend[pooling](v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
-           table.insert(grad_layers, {layer = c})
-        elseif torch.type(v):find'AveragePooling' then
+        if params.pooling == 'avg' and torch.type(v):find'MaxPooling' then
            local c = autograd_backend.SpatialAveragePooling(v.kW, v.kH, v.dW, v.dH, v.padW, v.padH)
            table.insert(grad_layers, {layer = c})
+        else
+           local c, params = autograd.functionalize(v)
+           if params then
+              table.insert(grad_layers, {layer = c, params = #net_params + 1})
+              table.insert(net_params, {v.weight, v.bias})
+           else
+              table.insert(grad_layers, {layer = c})
+           end
         end
 
         if v.name == content_layers[next_content_idx] then
